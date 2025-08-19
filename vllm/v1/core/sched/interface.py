@@ -44,7 +44,6 @@ class SchedulerInterface(ABC):
     @abstractmethod
     def update_from_output(
         self,
-        scheduler_output: "SchedulerOutput",
         model_runner_output: "ModelRunnerOutput",
     ) -> dict[int, "EngineCoreOutputs"]:
         """Update the scheduler state based on the model runner output.

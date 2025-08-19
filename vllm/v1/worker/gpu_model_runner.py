@@ -1461,6 +1461,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=[],
+            num_scheduled_tokens={},
+            scheduled_spec_decode_tokens={},
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=pooler_output,
@@ -1752,6 +1754,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=valid_sampled_token_ids,
+            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            scheduled_spec_decode_tokens=(
+                scheduler_output.scheduled_spec_decode_tokens),
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],

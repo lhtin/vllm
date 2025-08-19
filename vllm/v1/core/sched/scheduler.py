@@ -825,13 +825,14 @@ class Scheduler(SchedulerInterface):
 
     def update_from_output(
         self,
-        scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
-        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        num_scheduled_tokens = model_runner_output.num_scheduled_tokens
+        scheduled_spec_decode_tokens = \
+            model_runner_output.scheduled_spec_decode_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
 
@@ -856,8 +857,7 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = sampled_token_ids[
                 req_index] if sampled_token_ids else []
 
-            scheduled_spec_token_ids = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id))
+            scheduled_spec_token_ids = scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids:
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled

@@ -291,7 +291,7 @@ class EngineCore:
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
         engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output)  # type: ignore
+            model_output)  # type: ignore
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
@@ -349,8 +349,8 @@ class EngineCore:
                 lambda _: future.result(), scheduler_output)
 
             self.batch_queue.task_done()
-            engine_core_outputs = (self.scheduler.update_from_output(
-                scheduler_output, model_output))
+            engine_core_outputs = (
+                self.scheduler.update_from_output(model_output))
 
         return engine_core_outputs, scheduled_batch
 

@@ -94,6 +94,14 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]]
 
+    # req_id -> num_scheduled_tokens
+    # Number of tokens scheduled for each request.
+    num_scheduled_tokens: dict[str, int]
+    # req_id -> spec_token_ids
+    # If a request does not have any spec decode tokens, it will not be
+    # included in the dictionary.
+    scheduled_spec_decode_tokens: dict[str, list[int]]
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]
@@ -126,6 +134,8 @@ class DraftTokenIds:
 EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[],
                                               req_id_to_index={},
                                               sampled_token_ids=[],
+                                              num_scheduled_tokens={},
+                                              scheduled_spec_decode_tokens={},
                                               logprobs=None,
                                               prompt_logprobs_dict={},
                                               pooler_output=[],
