@@ -443,6 +443,10 @@ class EngineArgs:
     """Custom logitproc types"""
 
     async_scheduling: bool = SchedulerConfig.async_scheduling
+    async_step: bool = SchedulerConfig.async_step
+
+    # DEPRECATED
+    enable_prompt_adapter: bool = False
 
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
@@ -861,6 +865,8 @@ class EngineArgs:
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"])
         scheduler_group.add_argument("--async-scheduling",
                                      **scheduler_kwargs["async_scheduling"])
+        scheduler_group.add_argument("--async-step",
+                                     **scheduler_kwargs["async_step"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1239,12 +1245,14 @@ class EngineArgs:
             self.data_parallel_rpc_port
             is not None) else ParallelConfig.data_parallel_rpc_port
 
-        if self.async_scheduling:
+        if self.async_scheduling or self.async_step:
             # Async scheduling does not work with the uniprocess backend.
             if self.distributed_executor_backend is None:
                 self.distributed_executor_backend = "mp"
                 logger.info("Using mp-based distributed executor backend "
                             "for async scheduling.")
+                if self.async_step:
+                    logger.info("Using enhance async scheduling: async step.")
             if self.distributed_executor_backend == "uni":
                 raise ValueError("Async scheduling is not supported with "
                                  "uni-process backend.")
@@ -1328,6 +1336,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.
             disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
+            async_step=self.async_step,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

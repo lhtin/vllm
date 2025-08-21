@@ -307,6 +307,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ) if self.supports_mm_inputs else None)
 
         self.reorder_batch_threshold: Optional[int] = None
+        if self.scheduler_config.async_step:
+            self._prev_output: Optional[dict[str, Any]] = None
+            self.reorder_batch_threshold = 1
 
         # Attention layers that are only in the KVCacheConfig of the runner
         # (e.g., KV sharing, encoder-only attention), but not in the
@@ -329,6 +332,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             device=self.device,
                             pin_memory=self.pin_memory)
 
+    @torch.cuda.nvtx.range("GPUModelRunner._init_model_kwargs")
     def _init_model_kwargs(self, num_tokens: int):
         model_kwargs = dict[str, Any]()
         num_reqs = self.input_batch.num_reqs
@@ -384,7 +388,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return
 
         if self.reorder_batch_threshold is not None:
-            reorder_batch_to_split_decodes_and_prefills(
+            _, self._num_decodes = reorder_batch_to_split_decodes_and_prefills(
                 self.input_batch,
                 scheduler_output,
                 decode_threshold=self.reorder_batch_threshold)
@@ -400,6 +404,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    @torch.cuda.nvtx.range("GPUModelRunner._update_states")
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -659,6 +664,44 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return cu_num_tokens, arange
 
+    @torch.cuda.nvtx.range("GPUModelRunner._update_inputs")
+    def _update_inputs(self):
+        if not self._prev_output:
+            return
+
+        num_decodes = self._num_decodes
+        # If no decode requests are scheduled, we don't need to update inputs.
+        if num_decodes == 0:
+            return
+
+        # Determine the index correspondence between requests in two consecutive
+        # step
+        prev_req_id_to_index = self._prev_output["req_id_to_index"]
+        req_id_to_index = self.input_batch.req_id_to_index
+        curr_batch_indexs_host = []
+        prev_batch_indexs_host = []
+        for req_id, curr_index in req_id_to_index.items():
+            if curr_index < num_decodes and req_id in prev_req_id_to_index:
+                prev_index = prev_req_id_to_index.get(req_id)
+                curr_batch_indexs_host.append(curr_index)
+                prev_batch_indexs_host.append(prev_index)
+
+        curr_batch_indexs = torch.tensor(curr_batch_indexs_host,
+                                         dtype=torch.int32,
+                                         pin_memory=True).to(self.device,
+                                                             non_blocking=True)
+        prev_batch_indexs = torch.tensor(prev_batch_indexs_host,
+                                         dtype=torch.int32,
+                                         pin_memory=True).to(self.device,
+                                                             non_blocking=True)
+
+        # Update input_ids on GPU
+        prev_sampled_token_ids = self._prev_output["sampled_token_ids"]
+        input_ids = self.input_ids[:num_decodes].view(-1, 1)
+        input_ids[curr_batch_indexs] = prev_sampled_token_ids[
+            prev_batch_indexs]
+
+    @torch.cuda.nvtx.range("GPUModelRunner._prepare_inputs")
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -803,6 +846,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logits_indices_padded = (
                 self.kv_sharing_fast_prefill_logits_indices[:num_logits_padded]
             )
+
+        if self.scheduler_config.async_step:
+            # Must update before attn_metadata build
+            self._update_inputs()
 
         attn_metadata: dict[str, Any] = {}
 
@@ -1350,6 +1397,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             indices=out_indices if not skip_out_indices else None,
         )
 
+    @torch.cuda.nvtx.range(
+        "GPUModelRunner.sync_and_slice_intermediate_tensors")
     def sync_and_slice_intermediate_tensors(
             self, num_tokens: int, intermediate_tensors: IntermediateTensors,
             sync_self: bool) -> IntermediateTensors:
@@ -1469,8 +1518,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
         )
 
-    @torch.inference_mode()
     def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        total_num_scheduled_requests = (
+            len(scheduler_output.scheduled_new_reqs) +
+            scheduler_output.scheduled_cached_reqs.num_reqs)
+
+        @torch.cuda.nvtx.range("GPUModelRunner.execute_model"
+                               f"[num_reqs={total_num_scheduled_requests},"
+                               f"num_toks={total_num_scheduled_tokens}]")
+        def _execute_model():
+            return self._execute_model(scheduler_output, intermediate_tensors)
+
+        return _execute_model()
+
+    @torch.inference_mode()
+    def _execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
@@ -1565,6 +1632,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         cudagraph_runtime_mode, batch_descriptor = \
             self.cudagraph_dispatcher.dispatch(batch_descriptor)
 
+        # TODO(lehuading): If there are prefill requests, cannot run in CUDA
+        # graph modes, we return prev_output there instead after the model
+        # forward.
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with set_forward_context(
@@ -1575,7 +1645,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_descriptor,
         ), self.maybe_get_kv_connector_output(
-                scheduler_output) as kv_connector_output:
+                scheduler_output
+        ) as kv_connector_output, torch.cuda.nvtx.range("model.forward"):
 
             model_output = self.model(
                 input_ids=input_ids,
@@ -1682,6 +1753,61 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
 
+        if self.scheduler_config.async_step:
+            assert not self.input_batch.num_prompt_logprobs, (
+                "Async step not support sampling.prompt_logprobs")
+            assert not envs.VLLM_COMPUTE_NANS_IN_LOGITS, (
+                "Async step not support envs.VLLM_COMPUTE_NANS_IN_LOGITS")
+            assert not self.parallel_config.enable_eplb, (
+                "Async step not support parallel_config.enable_eplb")
+            output_data = self._prev_output
+            sampled_token_ids_host = sampler_output.sampled_token_ids.to(
+                "cpu", non_blocking=True)
+            logprobs_tensors_host = (sampler_output.logprobs_tensors.to(
+                "cpu", non_blocking=True) if sampler_output.logprobs_tensors
+                                     is not None else None)
+            sync_event = torch.Event()
+            sync_event.record()
+            self._prev_output = {
+                "req_ids": self.input_batch.req_ids.copy(),
+                "req_id_to_index": self.input_batch.req_id_to_index.copy(),
+                "sync_event": sync_event,
+                "sampled_token_ids": sampler_output.sampled_token_ids,
+                "sampled_token_ids_host": sampled_token_ids_host,
+                "logprobs_tensors_host": logprobs_tensors_host,
+                "discard_sampled_tokens_req_indices":
+                discard_sampled_tokens_req_indices,
+                "num_scheduled_tokens": scheduler_output.num_scheduled_tokens,
+                "scheduled_spec_decode_tokens":
+                scheduler_output.scheduled_spec_decode_tokens,
+                "kv_connector_output": kv_connector_output,
+            }
+
+            for req_id, req_idx in self.input_batch.req_id_to_index.items():
+                if req_idx in discard_sampled_tokens_req_indices:
+                    continue
+                sampled_ids = [-1]
+                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_idx = start_idx + len(sampled_ids)
+                assert end_idx <= self.max_model_len + 1, (
+                    "Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {end_idx} > max_model_len: "
+                    f"{self.max_model_len}")
+
+                self.input_batch.token_ids_cpu[req_idx,
+                                               start_idx:end_idx] = sampled_ids
+                self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+                self.input_batch.num_tokens[req_idx] = end_idx
+                req_id = self.input_batch.req_ids[req_idx]
+                req_state = self.requests[req_id]
+                req_state.output_token_ids.extend(sampled_ids)
+
+            if not output_data:
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
+            prev_model_runner_output = self._prepare_output(output_data)
+            return prev_model_runner_output
+
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
         logprobs_tensors = sampler_output.logprobs_tensors
@@ -1774,6 +1900,45 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
+
+    @torch.cuda.nvtx.range("GPUModelRunner._prepare_output")
+    def _prepare_output(self, output_data) -> ModelRunnerOutput:
+        # NOTE: GPU -> CPU Sync happens here.
+        output_data["sync_event"].synchronize()
+        logprobs_tensors = output_data["logprobs_tensors_host"]
+        sampled_token_ids = output_data["sampled_token_ids_host"]
+        discard_sampled_tokens_req_indices = output_data[
+            "discard_sampled_tokens_req_indices"]
+        req_ids = output_data["req_ids"]
+        req_id_to_index = output_data["req_id_to_index"]
+        scheduled_tokens = output_data["num_scheduled_tokens"]
+        scheduled_spec_decode_tokens = output_data[
+            "scheduled_spec_decode_tokens"]
+        kv_connector_output = output_data["kv_connector_output"]
+
+        logprobs_lists = logprobs_tensors.tolists() \
+            if logprobs_tensors is not None else None
+        # Get the valid generated tokens.
+        max_gen_len = sampled_token_ids.shape[-1]
+        assert max_gen_len == 1
+        valid_sampled_token_ids = sampled_token_ids.tolist()
+        # Mask out the sampled tokens that should not be sampled.
+        for i in discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids[i].clear()
+
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=valid_sampled_token_ids,
+            spec_token_ids=None,
+            num_scheduled_tokens=scheduled_tokens,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            logprobs=logprobs_lists,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=kv_connector_output,
+            num_nans_in_logits={},
+        )
 
     def propose_draft_token_ids(
         self,

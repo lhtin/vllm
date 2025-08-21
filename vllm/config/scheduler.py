@@ -159,6 +159,14 @@ class SchedulerConfig:
     structured outputs, speculative decoding, and pipeline parallelism.
     """
 
+    async_step: bool = False
+    """EXPERIMENTAL: If set to True, perform async scheduling and async execute
+    model. This may help reduce the CPU overheads, leading to better latency and
+    throughput. However, async scheduling is currently not supported with some
+    features such as structured outputs, speculative decoding, and pipeline
+    parallelism.
+    """
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -243,7 +251,7 @@ class SchedulerConfig:
         if not self.cuda_graph_sizes:
             self.cuda_graph_sizes = [min(self.max_num_seqs * 2, 512)]
 
-        if self.async_scheduling:
+        if self.async_scheduling or self.async_step:
             self.scheduler_cls = (
                 "vllm.v1.core.sched.async_scheduler.AsyncScheduler")
 

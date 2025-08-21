@@ -212,9 +212,8 @@ class XFormersAttentionMetadataBuilder(
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
-        return reorder_batch_to_split_decodes_and_prefills(input_batch,
-                                                           scheduler_output,
-                                                           decode_threshold=1)
+        return reorder_batch_to_split_decodes_and_prefills(
+            input_batch, scheduler_output, decode_threshold=1)[0]
 
     def build(
         self,

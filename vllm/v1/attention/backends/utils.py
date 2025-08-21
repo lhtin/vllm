@@ -601,7 +601,7 @@ def reorder_batch_to_split_decodes_and_prefills(
     input_batch: "InputBatch",
     scheduler_output: "SchedulerOutput",
     decode_threshold: int = 1,
-) -> bool:
+) -> tuple[bool, int]:
     """
     Reorders the batch to split into prefill and decode requests; places all
     requests with <= decode_threshold tokens at the front of the batch.
@@ -657,7 +657,7 @@ def reorder_batch_to_split_decodes_and_prefills(
         input_batch.swap_states(prefills[i - 1], decode_idx)
         modified_batch = True
 
-    return modified_batch
+    return modified_batch, num_decodes
 
 
 KV_SHARING_FAST_PREFILL_METADATA_FIELDS = [
