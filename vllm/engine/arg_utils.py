@@ -1443,6 +1443,13 @@ class EngineArgs:
                     "async scheduling."
                 )
 
+            if not self.disable_nccl_for_dp_synchronization:
+                logger.info(
+                    "Disabling NCCL for data parallel synchronization "
+                    "with async scheduling for better performance."
+                )
+                self.disable_nccl_for_dp_synchronization = True
+
         # Forward the deprecated CLI args to the EPLB config.
         if self.num_redundant_experts is not None:
             self.eplb_config.num_redundant_experts = self.num_redundant_experts
